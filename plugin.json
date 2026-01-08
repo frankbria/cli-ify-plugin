@@ -8,9 +8,6 @@
   "skills": [
     "skills/cli-ifying"
   ],
-  "bin": {
-    "verify-impl": "bin/verify-impl"
-  },
   "keywords": [
     "cli",
     "automation",
