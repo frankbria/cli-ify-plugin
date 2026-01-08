@@ -1,0 +1,21 @@
+{
+  "name": "cli-ify",
+  "version": "1.0.0",
+  "description": "Convert Claude Code skills, commands, and agents into standalone CLI tools",
+  "author": "frankbria",
+  "repository": "https://github.com/frankbria/cli-ify-plugin",
+  "license": "MIT",
+  "skills": [
+    "skills/cli-ifying"
+  ],
+  "bin": {
+    "verify-impl": "bin/verify-impl"
+  },
+  "keywords": [
+    "cli",
+    "automation",
+    "unix",
+    "bash",
+    "powershell"
+  ]
+}

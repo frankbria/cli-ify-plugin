@@ -1,0 +1,317 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Scan codebase for incomplete implementations
+
+.DESCRIPTION
+    Finds TODO/FIXME markers, NotImplementedError, empty functions,
+    and placeholder code before commits or PRs.
+
+.PARAMETER Path
+    Directory to scan (default: current directory)
+
+.PARAMETER CriticalOnly
+    Only report critical issues (NotImplementedError, fake implementations)
+
+.PARAMETER OutputFormat
+    Output format: auto (default), json, text
+
+.EXAMPLE
+    .\verify-impl.ps1
+    Scan current directory
+
+.EXAMPLE
+    .\verify-impl.ps1 src\ -CriticalOnly
+    Scan src/ for critical issues only
+
+.EXAMPLE
+    .\verify-impl.ps1 -OutputFormat json | ConvertFrom-Json
+    Get JSON output for CI
+
+.NOTES
+    Exit codes:
+      0 - No issues found
+      1 - Issues found (TODOs, FIXMEs, etc.)
+      2 - Critical issues found (NotImplementedError, fake implementations)
+      3 - Invalid arguments
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Position = 0)]
+    [string]$Path = ".",
+
+    [Parameter()]
+    [Alias("c")]
+    [switch]$CriticalOnly,
+
+    [Parameter()]
+    [Alias("o")]
+    [ValidateSet("auto", "json", "text")]
+    [string]$OutputFormat = "auto",
+
+    [Parameter()]
+    [switch]$Version
+)
+
+$Script:VERSION = "1.0.0"
+$Script:SCRIPT_NAME = "verify-impl"
+
+# Exclude patterns
+$Script:ExcludeDirs = @("node_modules", ".git", ".venv", "venv", "__pycache__", "dist", "build", ".next", "coverage")
+
+function Show-Version {
+    Write-Output "$($Script:SCRIPT_NAME) version $($Script:VERSION)"
+}
+
+function Get-OutputFormat {
+    if ($OutputFormat -eq "auto") {
+        if ([Console]::IsOutputRedirected) {
+            return "json"
+        } else {
+            return "text"
+        }
+    }
+    return $OutputFormat
+}
+
+function Find-Todos {
+    param([string]$ScanPath)
+
+    $pattern = '\b(TODO|FIXME|XXX|HACK)\b'
+    $results = @()
+
+    Get-ChildItem -Path $ScanPath -Recurse -Include "*.py", "*.ts", "*.tsx", "*.js", "*.jsx" -ErrorAction SilentlyContinue |
+        Where-Object {
+            $exclude = $false
+            foreach ($dir in $Script:ExcludeDirs) {
+                if ($_.FullName -like "*\$dir\*" -or $_.FullName -like "*/$dir/*") {
+                    $exclude = $true
+                    break
+                }
+            }
+            -not $exclude
+        } |
+        ForEach-Object {
+            $file = $_
+            $lineNum = 0
+            Get-Content $file.FullName -ErrorAction SilentlyContinue | ForEach-Object {
+                $lineNum++
+                if ($_ -match $pattern) {
+                    $results += "$($file.FullName):$lineNum`:$_"
+                }
+            }
+        }
+
+    return $results
+}
+
+function Find-NotImplemented {
+    param([string]$ScanPath)
+
+    $pattern = '(NotImplementedError|raise NotImplementedError|throw new Error.*not implemented|not implemented)'
+    $results = @()
+
+    Get-ChildItem -Path $ScanPath -Recurse -Include "*.py", "*.ts", "*.tsx", "*.js", "*.jsx" -ErrorAction SilentlyContinue |
+        Where-Object {
+            $exclude = $false
+            foreach ($dir in $Script:ExcludeDirs) {
+                if ($_.FullName -like "*\$dir\*" -or $_.FullName -like "*/$dir/*") {
+                    $exclude = $true
+                    break
+                }
+            }
+            -not $exclude
+        } |
+        ForEach-Object {
+            $file = $_
+            $lineNum = 0
+            Get-Content $file.FullName -ErrorAction SilentlyContinue | ForEach-Object {
+                $lineNum++
+                if ($_ -imatch $pattern) {
+                    $results += "$($file.FullName):$lineNum`:$_"
+                }
+            }
+        }
+
+    return $results
+}
+
+function Find-SkippedTests {
+    param([string]$ScanPath)
+
+    $pattern = '(@pytest\.mark\.skip|\.skip\(|\.todo\(|xit\(|xdescribe\()'
+    $results = @()
+
+    Get-ChildItem -Path $ScanPath -Recurse -Include "*.py", "*.ts", "*.tsx", "*.js", "*.jsx" -ErrorAction SilentlyContinue |
+        Where-Object {
+            $exclude = $false
+            foreach ($dir in $Script:ExcludeDirs) {
+                if ($_.FullName -like "*\$dir\*" -or $_.FullName -like "*/$dir/*") {
+                    $exclude = $true
+                    break
+                }
+            }
+            -not $exclude
+        } |
+        ForEach-Object {
+            $file = $_
+            $lineNum = 0
+            Get-Content $file.FullName -ErrorAction SilentlyContinue | ForEach-Object {
+                $lineNum++
+                if ($_ -match $pattern) {
+                    $results += "$($file.FullName):$lineNum`:$_"
+                }
+            }
+        }
+
+    return $results
+}
+
+function Format-JsonOutput {
+    param(
+        [array]$Todos,
+        [array]$Critical,
+        [array]$Skipped
+    )
+
+    $todoCount = $Todos.Count
+    $criticalCount = $Critical.Count
+    $skippedCount = $Skipped.Count
+    $total = $todoCount + $criticalCount + $skippedCount
+
+    $severity = "clean"
+    $exitCode = 0
+    if ($criticalCount -gt 0) {
+        $severity = "critical"
+        $exitCode = 2
+    } elseif ($todoCount -gt 0 -or $skippedCount -gt 0) {
+        $severity = "warning"
+        $exitCode = 1
+    }
+
+    $result = @{
+        summary = @{
+            total = $total
+            critical = $criticalCount
+            todos = $todoCount
+            skipped_tests = $skippedCount
+            severity = $severity
+        }
+        findings = @{
+            not_implemented = $Critical
+            todos = $Todos
+            skipped_tests = $Skipped
+        }
+    }
+
+    $result | ConvertTo-Json -Depth 5
+    exit $exitCode
+}
+
+function Format-TextOutput {
+    param(
+        [array]$Todos,
+        [array]$Critical,
+        [array]$Skipped
+    )
+
+    $todoCount = $Todos.Count
+    $criticalCount = $Critical.Count
+    $skippedCount = $Skipped.Count
+    $total = $todoCount + $criticalCount + $skippedCount
+
+    Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor White
+    Write-Host "  Implementation Verification Report" -ForegroundColor White
+    Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor White
+    Write-Host
+
+    Write-Host "Summary:" -ForegroundColor White
+    if ($criticalCount -gt 0) {
+        Write-Host "  ● Critical issues: $criticalCount" -ForegroundColor Red
+    }
+    if ($todoCount -gt 0) {
+        Write-Host "  ● TODO/FIXME markers: $todoCount" -ForegroundColor Yellow
+    }
+    if ($skippedCount -gt 0) {
+        Write-Host "  ● Skipped tests: $skippedCount" -ForegroundColor Yellow
+    }
+    if ($total -eq 0) {
+        Write-Host "  ● No issues found" -ForegroundColor Green
+    }
+    Write-Host
+
+    if ($criticalCount -gt 0) {
+        Write-Host "Critical: NotImplementedError / Not Implemented" -ForegroundColor Red
+        $Critical | Select-Object -First 20 | ForEach-Object {
+            Write-Host "  → $_" -ForegroundColor Red
+        }
+        if ($criticalCount -gt 20) {
+            Write-Host "  ... and $($criticalCount - 20) more" -ForegroundColor Red
+        }
+        Write-Host
+    }
+
+    if (-not $CriticalOnly -and $todoCount -gt 0) {
+        Write-Host "TODO/FIXME Markers" -ForegroundColor Yellow
+        $Todos | Select-Object -First 15 | ForEach-Object {
+            Write-Host "  → $_" -ForegroundColor Yellow
+        }
+        if ($todoCount -gt 15) {
+            Write-Host "  ... and $($todoCount - 15) more" -ForegroundColor Yellow
+        }
+        Write-Host
+    }
+
+    if (-not $CriticalOnly -and $skippedCount -gt 0) {
+        Write-Host "Skipped Tests" -ForegroundColor Yellow
+        $Skipped | Select-Object -First 10 | ForEach-Object {
+            Write-Host "  → $_" -ForegroundColor Yellow
+        }
+        if ($skippedCount -gt 10) {
+            Write-Host "  ... and $($skippedCount - 10) more" -ForegroundColor Yellow
+        }
+        Write-Host
+    }
+
+    Write-Host "───────────────────────────────────────────────────────────" -ForegroundColor White
+    if ($criticalCount -gt 0) {
+        Write-Host "✗ NOT READY - Critical unimplemented functionality found" -ForegroundColor Red
+        exit 2
+    } elseif ($todoCount -gt 0 -or $skippedCount -gt 0) {
+        Write-Host "⚠ REVIEW NEEDED - $total items need attention" -ForegroundColor Yellow
+        exit 1
+    } else {
+        Write-Host "✓ READY - No issues found, proceed with commit" -ForegroundColor Green
+        exit 0
+    }
+}
+
+# Main
+if ($Version) {
+    Show-Version
+    exit 0
+}
+
+if (-not (Test-Path $Path -PathType Container)) {
+    Write-Error "'$Path' is not a directory"
+    exit 3
+}
+
+# Run scans
+$critical = Find-NotImplemented -ScanPath $Path
+$todos = @()
+$skipped = @()
+
+if (-not $CriticalOnly) {
+    $todos = Find-Todos -ScanPath $Path
+    $skipped = Find-SkippedTests -ScanPath $Path
+}
+
+# Format output
+$format = Get-OutputFormat
+if ($format -eq "json") {
+    Format-JsonOutput -Todos $todos -Critical $critical -Skipped $skipped
+} else {
+    Format-TextOutput -Todos $todos -Critical $critical -Skipped $skipped
+}

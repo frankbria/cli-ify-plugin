@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+# ============================================================
+# verify-impl - Scan codebase for incomplete implementations
+#
+# Finds TODO/FIXME markers, NotImplementedError, empty functions,
+# and placeholder code before commits or PRs.
+#
+# Exit codes:
+#   0 - No issues found
+#   1 - Issues found (TODOs, FIXMEs, etc.)
+#   2 - Critical issues found (NotImplementedError, fake implementations)
+#   3 - Invalid arguments
+# ============================================================
+set -euo pipefail
+
+readonly VERSION="1.0.0"
+readonly SCRIPT_NAME="verify-impl"
+
+# Colors (only if terminal supports it)
+if [[ -t 1 ]] && [[ "${TERM:-}" != "dumb" ]]; then
+    readonly RED='\033[0;31m'
+    readonly GREEN='\033[0;32m'
+    readonly YELLOW='\033[0;33m'
+    readonly BLUE='\033[0;34m'
+    readonly BOLD='\033[1m'
+    readonly NC='\033[0m'
+else
+    readonly RED='' GREEN='' YELLOW='' BLUE='' BOLD='' NC=''
+fi
+
+# Configuration
+OUTPUT_FORMAT="auto"  # auto, json, text
+CRITICAL_ONLY=false
+VERBOSE=false
+SCAN_PATH="."
+
+# Exclude patterns for grep
+EXCLUDE_DIRS="node_modules|\.git|\.venv|venv|__pycache__|dist|build|\.next|coverage"
+
+show_help() {
+    cat << 'EOF'
+verify-impl - Scan codebase for incomplete implementations
+
+USAGE:
+    verify-impl [path] [options]
+
+ARGUMENTS:
+    path                Directory to scan (default: current directory)
+
+OPTIONS:
+    -c, --critical-only Only report critical issues (NotImplementedError, fake implementations)
+    -o, --output FORMAT Output format: auto (default), json, text
+    -v, --verbose       Show additional details
+    -h, --help          Show this help
+    --version           Show version
+
+EXIT CODES:
+    0   No issues found - ready to commit
+    1   Issues found (TODOs, FIXMEs, etc.)
+    2   Critical issues found (NotImplementedError, fake implementations)
+    3   Invalid arguments
+
+EXAMPLES:
+    verify-impl                      # Scan current directory
+    verify-impl src/                 # Scan specific directory
+    verify-impl --critical-only      # Only critical issues
+    verify-impl --output json        # JSON output for CI
+    verify-impl && git commit        # Only commit if clean
+
+WHAT IT FINDS:
+    Critical:
+    - NotImplementedError / throw new Error("not implemented")
+    - Empty function bodies (def func(): pass)
+    - Fake implementations (functions that only log/return hardcoded values)
+
+    Standard:
+    - TODO / FIXME / XXX / HACK comments
+    - Skipped tests (@pytest.mark.skip, .skip(), xit())
+EOF
+}
+
+show_version() {
+    echo "$SCRIPT_NAME version $VERSION"
+}
+
+# Detect if we should use JSON output
+detect_output_format() {
+    if [[ "$OUTPUT_FORMAT" == "auto" ]]; then
+        if [[ -t 1 ]]; then
+            OUTPUT_FORMAT="text"
+        else
+            OUTPUT_FORMAT="json"
+        fi
+    fi
+}
+
+# Find TODO/FIXME markers
+find_todos() {
+    local path="$1"
+    grep -rn --include="*.py" --include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" \
+        -E '\b(TODO|FIXME|XXX|HACK)\b' "$path" 2>/dev/null | \
+        grep -vE "$EXCLUDE_DIRS" || true
+}
+
+# Find NotImplementedError and explicit "not implemented"
+find_not_implemented() {
+    local path="$1"
+    grep -rn --include="*.py" --include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" \
+        -iE '(NotImplementedError|raise NotImplementedError|throw new Error.*not implemented|not implemented)' "$path" 2>/dev/null | \
+        grep -vE "$EXCLUDE_DIRS" || true
+}
+
+# Find empty function bodies (Python: pass, JS/TS: empty braces)
+find_empty_functions() {
+    local path="$1"
+    # Python functions with just pass
+    grep -rn --include="*.py" -E '^\s*def\s+\w+\s*\([^)]*\)\s*:\s*$' "$path" 2>/dev/null | \
+        grep -vE "$EXCLUDE_DIRS" | while read -r line; do
+            file=$(echo "$line" | cut -d: -f1)
+            lineno=$(echo "$line" | cut -d: -f2)
+            # Check if next non-empty line is 'pass' or just docstring + pass
+            next_lines=$(sed -n "$((lineno+1)),$((lineno+5))p" "$file" 2>/dev/null | grep -v '^\s*$' | grep -v '^\s*"""' | grep -v "^\s*'''" | head -1)
+            if echo "$next_lines" | grep -qE '^\s*pass\s*$'; then
+                echo "$line"
+            fi
+        done || true
+}
+
+# Find skipped tests
+find_skipped_tests() {
+    local path="$1"
+    grep -rn --include="*.py" --include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" \
+        -E '(@pytest\.mark\.skip|it\.skip\(|test\.skip\(|describe\.skip\(|\.todo\(|\bxit\(|\bxdescribe\()' "$path" 2>/dev/null | \
+        grep -vE "$EXCLUDE_DIRS" || true
+}
+
+# Count lines in results
+count_results() {
+    local results="$1"
+    if [[ -z "$results" ]]; then
+        echo 0
+    else
+        echo "$results" | wc -l | tr -d ' '
+    fi
+}
+
+# Convert newline-separated list to JSON array
+to_json_array() {
+    local input="$1"
+    if [[ -z "$input" ]]; then
+        echo "[]"
+    else
+        echo "$input" | jq -R -s 'split("\n") | map(select(. != ""))'
+    fi
+}
+
+# Format results as JSON
+format_json() {
+    local todos="$1"
+    local critical="$2"
+    local empty="$3"
+    local skipped="$4"
+
+    local todo_count=$(count_results "$todos")
+    local critical_count=$(count_results "$critical")
+    local empty_count=$(count_results "$empty")
+    local skipped_count=$(count_results "$skipped")
+    local total=$((todo_count + critical_count + empty_count + skipped_count))
+
+    # Determine severity
+    local severity="clean"
+    local exit_code=0
+    if [[ $critical_count -gt 0 ]] || [[ $empty_count -gt 0 ]]; then
+        severity="critical"
+        exit_code=2
+    elif [[ $todo_count -gt 0 ]] || [[ $skipped_count -gt 0 ]]; then
+        severity="warning"
+        exit_code=1
+    fi
+
+    # Build JSON arrays
+    local critical_json=$(to_json_array "$critical")
+    local empty_json=$(to_json_array "$empty")
+    local todos_json=$(to_json_array "$todos")
+    local skipped_json=$(to_json_array "$skipped")
+
+    # Output JSON
+    cat << EOF
+{
+  "summary": {
+    "total": $total,
+    "critical": $((critical_count + empty_count)),
+    "todos": $todo_count,
+    "skipped_tests": $skipped_count,
+    "severity": "$severity"
+  },
+  "findings": {
+    "not_implemented": $critical_json,
+    "empty_functions": $empty_json,
+    "todos": $todos_json,
+    "skipped_tests": $skipped_json
+  }
+}
+EOF
+    return $exit_code
+}
+
+# Format results as text
+format_text() {
+    local todos="$1"
+    local critical="$2"
+    local empty="$3"
+    local skipped="$4"
+
+    local todo_count=$(count_results "$todos")
+    local critical_count=$(count_results "$critical")
+    local empty_count=$(count_results "$empty")
+    local skipped_count=$(count_results "$skipped")
+    local total=$((todo_count + critical_count + empty_count + skipped_count))
+
+    echo -e "${BOLD}═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}  Implementation Verification Report${NC}"
+    echo -e "${BOLD}═══════════════════════════════════════════════════════════${NC}"
+    echo
+
+    # Summary
+    echo -e "${BOLD}Summary:${NC}"
+    if [[ $critical_count -gt 0 ]] || [[ $empty_count -gt 0 ]]; then
+        echo -e "  ${RED}●${NC} Critical issues: $((critical_count + empty_count))"
+    fi
+    if [[ $todo_count -gt 0 ]]; then
+        echo -e "  ${YELLOW}●${NC} TODO/FIXME markers: $todo_count"
+    fi
+    if [[ $skipped_count -gt 0 ]]; then
+        echo -e "  ${YELLOW}●${NC} Skipped tests: $skipped_count"
+    fi
+    if [[ $total -eq 0 ]]; then
+        echo -e "  ${GREEN}●${NC} No issues found"
+    fi
+    echo
+
+    # Critical issues
+    if [[ $critical_count -gt 0 ]]; then
+        echo -e "${RED}${BOLD}Critical: NotImplementedError / Not Implemented${NC}"
+        echo "$critical" | head -20 | while read -r line; do
+            echo -e "  ${RED}→${NC} $line"
+        done
+        [[ $critical_count -gt 20 ]] && echo -e "  ${RED}... and $((critical_count - 20)) more${NC}"
+        echo
+    fi
+
+    # Empty functions
+    if [[ $empty_count -gt 0 ]]; then
+        echo -e "${RED}${BOLD}Critical: Empty Function Bodies${NC}"
+        echo "$empty" | head -10 | while read -r line; do
+            echo -e "  ${RED}→${NC} $line"
+        done
+        [[ $empty_count -gt 10 ]] && echo -e "  ${RED}... and $((empty_count - 10)) more${NC}"
+        echo
+    fi
+
+    # TODOs (skip if critical-only)
+    if [[ "$CRITICAL_ONLY" == "false" ]] && [[ $todo_count -gt 0 ]]; then
+        echo -e "${YELLOW}${BOLD}TODO/FIXME Markers${NC}"
+        echo "$todos" | head -15 | while read -r line; do
+            echo -e "  ${YELLOW}→${NC} $line"
+        done
+        [[ $todo_count -gt 15 ]] && echo -e "  ${YELLOW}... and $((todo_count - 15)) more${NC}"
+        echo
+    fi
+
+    # Skipped tests (skip if critical-only)
+    if [[ "$CRITICAL_ONLY" == "false" ]] && [[ $skipped_count -gt 0 ]]; then
+        echo -e "${YELLOW}${BOLD}Skipped Tests${NC}"
+        echo "$skipped" | head -10 | while read -r line; do
+            echo -e "  ${YELLOW}→${NC} $line"
+        done
+        [[ $skipped_count -gt 10 ]] && echo -e "  ${YELLOW}... and $((skipped_count - 10)) more${NC}"
+        echo
+    fi
+
+    # Verdict
+    echo -e "${BOLD}───────────────────────────────────────────────────────────${NC}"
+    if [[ $critical_count -gt 0 ]] || [[ $empty_count -gt 0 ]]; then
+        echo -e "${RED}${BOLD}✗ NOT READY${NC} - Critical unimplemented functionality found"
+        return 2
+    elif [[ $todo_count -gt 0 ]] || [[ $skipped_count -gt 0 ]]; then
+        echo -e "${YELLOW}${BOLD}⚠ REVIEW NEEDED${NC} - $total items need attention"
+        return 1
+    else
+        echo -e "${GREEN}${BOLD}✓ READY${NC} - No issues found, proceed with commit"
+        return 0
+    fi
+}
+
+# Main scan function
+run_scan() {
+    local path="$1"
+
+    # Validate path
+    if [[ ! -d "$path" ]]; then
+        echo "Error: '$path' is not a directory" >&2
+        exit 3
+    fi
+
+    # Run scans
+    local todos="" critical="" empty="" skipped=""
+
+    critical=$(find_not_implemented "$path")
+    empty=$(find_empty_functions "$path")
+
+    if [[ "$CRITICAL_ONLY" == "false" ]]; then
+        todos=$(find_todos "$path")
+        skipped=$(find_skipped_tests "$path")
+    fi
+
+    # Format output
+    detect_output_format
+    if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+        format_json "$todos" "$critical" "$empty" "$skipped"
+    else
+        format_text "$todos" "$critical" "$empty" "$skipped"
+    fi
+}
+
+# Parse arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -c|--critical-only)
+                CRITICAL_ONLY=true
+                shift
+                ;;
+            -o|--output)
+                OUTPUT_FORMAT="${2:-auto}"
+                shift 2
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            --version)
+                show_version
+                exit 0
+                ;;
+            -*)
+                echo "Error: Unknown option: $1" >&2
+                echo "Run '$SCRIPT_NAME --help' for usage." >&2
+                exit 3
+                ;;
+            *)
+                SCAN_PATH="$1"
+                shift
+                ;;
+        esac
+    done
+}
+
+main() {
+    parse_args "$@"
+    run_scan "$SCAN_PATH"
+}
+
+main "$@"
