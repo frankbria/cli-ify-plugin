@@ -1,5 +1,7 @@
 # cli-ify
 
+[![Follow on X](https://img.shields.io/twitter/follow/FrankBria18044?style=social)](https://x.com/FrankBria18044)
+
 Convert Claude Code skills, commands, and agents into standalone CLI tools for Linux/Mac (Bash) and Windows (PowerShell).
 
 ## Why CLI-ify?
